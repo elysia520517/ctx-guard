@@ -1,24 +1,30 @@
-# ctx-guard
+# ctx-guard · 上下文卫士
 
 **Keep long Claude Code sessions from blowing up the context window — automatically.**
 
 <p align="center"><b>English</b> · <a href="README.md">中文</a></p>
 
-`ctx-guard` is a [Claude Code](https://claude.com/claude-code) skill plus a small set of
-hooks and a watchdog process. It does three things:
+`ctx-guard` is a [Claude Code](https://claude.com/claude-code) skill: one SKILL.md, a
+handful of hooks, and a small watchdog process. It exists for one problem — you're deep
+in a session, and the context window fills up.
 
-1. **Splits oversized input before it ever hits the context.**
-   Paste a huge block of text → it's written to disk, chunked, and handed to subagents
-   one chunk at a time. Only the subagents' *conclusions* enter your context; the raw
-   text never does.
-2. **Hard-blocks the classic context killers.**
-   A `PreToolUse` hook refuses to whole-read a >200 KB text file or dump a huge file with
-   a bare `cat`, and feeds a "use `offset`/`limit` / `| head`" hint back to the model.
-3. **Auto-restarts when the window fills up.**
-   A `SessionStart` hook re-injects a compact handoff on restart, and an optional
-   `watchdog.py` process watches the session and — when it's **busy and nearly full** —
-   writes a handoff and launches a fresh `claude --bg` session that continues the work.
-   Zero manual action.
+It handles three things.
+
+**1. Oversized input never reaches the context in the first place.**
+Paste a wall of text and it lands on disk, gets chunked, and is handed to subagents one
+chunk at a time. Only the subagents' *conclusions* enter your context — **the raw text
+never does.**
+
+**2. The classic context killers get hard-blocked.**
+A `PreToolUse` hook refuses to whole-read a text file over 200 KB, and refuses to let a
+bare `cat` dump a huge file into the window. It feeds a hint back to the model — "use
+`offset`/`limit`, or pipe through `head`" — and lets it retry.
+
+**3. When the window fills up, it restarts itself and keeps going.**
+On restart, a `SessionStart` hook re-injects a compact handoff. An optional `watchdog.py`
+sits in the background, and whenever it sees the session is **busy and nearly full**, it
+writes a handoff and launches a fresh `claude --bg` session to carry on. **You don't lift
+a finger.**
 
 > **Not affiliated with Anthropic.** Built against Claude Code `2.1.295`.
 
@@ -41,8 +47,8 @@ Two counter-intuitive findings:
   each ~34 KB summary enters history. The cure is **proactively `/clear`**, not waiting
   for auto-compact.
 
-So this tool covers ~⅓ of the problem (input + tool output) that a skill *can* reach;
-thinking and compaction are handled by restarting early and clearing often.
+So this tool covers the ~⅓ of the problem a skill *can* reach (input + tool output).
+Thinking and compaction are handled by restarting early and clearing often.
 
 ---
 
@@ -65,14 +71,15 @@ skills/ctx-guard/
     └── watchdog.py       # auto-restart when a busy session nears the limit
 ```
 
-All scripts are **read-only** w.r.t. your code; they only write under
+Every script is **read-only** with respect to your code. They only write under
 `~/.claude/` and a `.ctxguard-paste/` folder in the current directory.
 
 ---
 
 ## Install
 
-Clone this repo somewhere, then copy or symlink the skill into your Claude Code skills dir:
+Clone the repo anywhere, then copy — or symlink — the skill into your Claude Code skills
+directory:
 
 ```bash
 # macOS / Linux
@@ -82,8 +89,8 @@ cp -r skills/ctx-guard ~/.claude/skills/
 Copy-Item -Recurse skills\ctx-guard "$env:USERPROFILE\.claude\skills\"
 ```
 
-Then wire up the hooks in `~/.claude/settings.json` (merge, don't overwrite — keep your
-existing `env`, etc.):
+Then wire the hooks into `~/.claude/settings.json`. **Merge** them in — don't overwrite the
+existing `env` and friends:
 
 ```json
 {
@@ -110,10 +117,10 @@ existing `env`, etc.):
 ```
 
 On Windows, use absolute paths (e.g. `python -I C:/Users/you/.claude/skills/.../gate.py`).
-**Restart the session** for hooks to take effect.
+**Restart the session** for the hooks to take effect.
 
-> Always invoke the scripts with `python -I` — it isolates them from the current
-> directory so a stray local `json.py`/`sitecustomize.py` can't hijack them.
+> Always invoke scripts with `python -I`. It isolates them from the current directory, so a
+> stray local `json.py` or `sitecustomize.py` can't get loaded first and hijack them.
 
 ---
 
@@ -124,13 +131,13 @@ S=~/.claude/skills/ctx-guard/scripts
 
 # health check: what's filling this session?
 python -I $S/scan.py --top 12
-python -I $S/scan.py --all                # rank all sessions by size
+python -I $S/scan.py --all                # rank all sessions in this project by size
 
 # chunk oversized text for staged execution
 python -I $S/split.py big.txt --max-kb 40
 python -I $S/split.py big.txt --chunks 8 --overlap-lines 3
 
-# prepare a handoff, then restart and say "continue"
+# write a handoff, then restart and say "continue"
 python -I $S/resume.py
 ```
 
@@ -141,21 +148,24 @@ python -I $S/watchdog.py --dir "/path/to/your/project" --threshold 82 --poll 20 
 # or on Windows: watchdog.cmd "C:\path\to\your\project"
 ```
 
-The watchdog restarts **only** when the session is genuinely in trouble:
-- the session is `busy` **and** usage ≥ threshold, or
-- the session **ended while it was busy** (crashed / killed mid-task).
+The watchdog only steps in when a session is genuinely in trouble:
 
-It does **not** restart an idle session sitting at high usage (that's just waiting for
-you) — this prevents pointless "resurrections".
+- it's `busy` **and** usage is at or past the threshold, or
+- it **ended while it was busy** (crashed, or killed mid-task).
 
-**Prerequisite:** the target directory must be **trusted** by Claude Code. Run `claude`
-interactively there once and accept the trust prompt, or `claude --bg` will refuse to
-start. The watchdog reports this and stops cleanly rather than spinning.
+It will **not** restart an idle session that merely sits at high usage — that session is
+just waiting on you — which is what keeps it from pointlessly "resurrecting" things.
 
-`--max-restarts` is the **safety rope** (default launcher uses 10); set it to cap spend.
+**Prerequisite:** the target directory has to be **trusted** by Claude Code first. Run
+`claude` there interactively once and accept the trust prompt; otherwise `claude --bg`
+refuses to start. When that happens the watchdog says so plainly and exits cleanly, rather
+than spinning in place.
 
-**Scripts must run under `python -I` and each reconfigures stdout/stderr to UTF-8**
-(Windows consoles default to GBK, which garbles the Chinese messages these scripts emit).
+`--max-restarts` is the **safety rope** (the launcher defaults to 10) — it caps auto-restarts
+so spend can't run away.
+
+**Scripts must run under `python -I`, and each one reconfigures stdout/stderr to UTF-8.**
+Windows consoles default to GBK, which would garble the Chinese these scripts print.
 
 ---
 
