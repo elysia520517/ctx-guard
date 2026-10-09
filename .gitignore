@@ -1,0 +1,11 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# ctx-guard runtime artifacts (never commit these)
+.ctxguard-paste/
+.ctxguard-watchdog.log
+RESUME_NEXT.md
+RESUME_NEXT.md.consumed
+CTX_DIGEST.md
