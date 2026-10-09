@@ -17,14 +17,19 @@ try:
 except Exception:
     pass
 
-USAGE_FILE = os.path.join(os.path.expanduser("~"), ".claude", "ctx-guard-usage.json")
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+import harness as _harness     # 适配器 + hook 输入大门
+import config as _config       # 统一配置读取
+
+H = None
 
 
 def main():
-    try:
-        d = json.load(sys.stdin)
-    except Exception:
-        d = {}
+    global H
+    H = _harness.get_adapter()
+    d = _harness.read_payload() or {}   # 没有输入也要照常打一行（与旧行为一致）
 
     cw = d.get("context_window") or {}
     used = cw.get("used_percentage")
@@ -33,7 +38,7 @@ def main():
     # 用量看板：写文件供其他 hook 读（含时间戳，过期的自动失效）
     try:
         model = d.get("model")
-        with open(USAGE_FILE, "w", encoding="utf-8") as fh:
+        with open(H.usage_file(), "w", encoding="utf-8") as fh:
             json.dump({"ts": time.time(),
                        "session_id": d.get("session_id"),
                        "used_percentage": used,
@@ -50,7 +55,7 @@ def main():
     sid = d.get("session_id")
     if sid:
         try:
-            d2 = os.path.join(os.path.expanduser("~"), ".claude", "ctx-guard-sessions")
+            d2 = H.sessions_dir()
             os.makedirs(d2, exist_ok=True)
             with open(os.path.join(d2, "%s.json" % sid), "w", encoding="utf-8") as fh:
                 json.dump({"ts": time.time(), "session_id": sid,

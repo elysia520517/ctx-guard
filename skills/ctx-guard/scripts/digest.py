@@ -19,16 +19,19 @@ try:
 except Exception:
     pass
 
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+import harness as _harness          # harness 探测 + 适配器
+import paths as _paths              # transcript / 项目目录定位（唯一实现）
+
 
 def project_dir(cwd=None):
-    cwd = cwd or os.getcwd()
-    slug = re.sub(r"[^A-Za-z0-9]", "-", cwd)   # Claude 的项目目录名规则：所有非字母数字 -> "-"
-    return os.path.join(os.path.expanduser("~"), ".claude", "projects", slug)
+    return _harness.locator().project_dir(cwd)
 
 
 def newest_transcript(pdir):
-    files = glob.glob(os.path.join(pdir, "*.jsonl"))
-    return max(files, key=os.path.getmtime) if files else None
+    return _harness.locator().newest_transcript(pdir)
 
 
 def clip(s, n):
@@ -37,7 +40,8 @@ def clip(s, n):
 
 
 def ts(d):
-    t = d.get("timestamp")
+    # 兼容两种入参：原始 transcript 行（key=timestamp）与归一化事件（key=ts）
+    t = d.get("timestamp") or d.get("ts")
     if not t:
         return ""
     try:
@@ -56,49 +60,41 @@ def digest(path, max_bytes=8192):
     first_ts = last_ts = ""
     n_tool = 0
 
-    for line in open(path, "rb"):
-        try:
-            d = json.loads(line)
-        except Exception:
-            continue
-        msg = d.get("message") or {}
-        role = msg.get("role") or d.get("type")
-        content = msg.get("content")
-        if not (first_ts or last_ts):
-            first_ts = last_ts = ts(d)
-        last_ts = ts(d) or last_ts
+    # 走适配器的归一化事件流（换 harness 只换适配器，这里的取舍逻辑不动）
+    A = _harness.get_adapter()
+    for ev in A.read_transcript(path):
+        k = ev.get("kind")
+        if k == "_stats":
+            first_ts = ts({"timestamp": ev.get("first_ts") or ""})
+            last_ts = ts({"timestamp": ev.get("last_ts") or ""})
+            break
 
-        if isinstance(content, str):
-            if role == "user":
+        if k == "text":
+            content = ev.get("text") or ""
+            # 与旧实现严格等价：**只有字符串形式的 user 内容**才算"用户说过的话"；
+            # 列表里的 text 块一律只喂给"最后几段助手正文"。别顺手改成 role 判断。
+            if ev.get("from") == "string" and ev.get("role") == "user":
                 t = clip(content, 400)
-                # 跳过纯系统提示/命令回显
                 if t and not t.startswith("<") and "system-reminder" not in t[:40]:
-                    prompts.append((ts(d), t))
-            elif role == "assistant" and content.strip():
+                    prompts.append((ts(ev), t))
+            elif ev.get("role") == "assistant" and content.strip():
                 last_assistant.append(clip(content, 300))
             continue
-        if not isinstance(content, list):
-            continue
-        for blk in content:
-            if not isinstance(blk, dict):
-                continue
-            t = blk.get("type")
-            if t == "tool_use":
-                n_tool += 1
-                name = blk.get("name", "?")
-                inp = blk.get("input") or {}
-                fp = inp.get("file_path") or inp.get("notebook_path")
-                if fp:
-                    files[fp] += 1
-                    if name in ("Write", "Edit", "NotebookEdit"):
-                        wrote[fp] += 1
-                elif name == "Bash" and inp.get("command"):
-                    cmds.append(clip(inp["command"], 130))
-                elif name == "Agent" and inp.get("prompt"):
-                    asks.append(clip(inp.get("prompt"), 130))
-            elif t == "text" and role == "assistant":
-                if blk.get("text", "").strip():
-                    last_assistant.append(clip(blk["text"], 300))
+        if k == "tool_use":
+            n_tool += 1
+            name = ev.get("name", "?")
+            inp = ev.get("input") or {}
+            fp = inp.get("file_path") or inp.get("notebook_path")
+            if fp:
+                files[fp] += 1
+                if name in ("Write", "Edit", "NotebookEdit"):
+                    wrote[fp] += 1
+            elif name == "Bash" and inp.get("command"):
+                cmds.append(clip(inp["command"], 130))
+            elif name == "Agent" and inp.get("prompt"):
+                asks.append(clip(inp.get("prompt"), 130))
+        elif k == "thinking":
+            continue        # 交接单里不留思考
 
     out = []
     A = out.append

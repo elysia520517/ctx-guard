@@ -75,7 +75,16 @@ skills/ctx-guard/
     ├── paste_split.py    # UserPromptSubmit：长粘贴 → 落盘 + 切块 + 规则
     ├── session_resume.py # SessionStart：重启后自动注入交接单
     ├── statusline.py     # statusLine：显示 `ctx NN%`，并写用量给 watchdog
-    └── watchdog.py       # 会话忙且快满时，自动重启接力
+    ├── watchdog.py       # 会话忙且快满时，自动重启接力
+    │
+    ├── harness.py        # 探测当前跑在哪个工具下 + hook 输入大门
+    ├── adapter_base.py   # 适配器基类与"归一化事件流"约定
+    ├── adapter_claude.py # Claude Code 适配器（默认、最完整）
+    ├── adapter_codex.py  # Codex CLI 适配器（骨架，未实测）
+    ├── adapter_openai.py # OpenAI Agents SDK 适配器（鸭子类型接入）
+    ├── config.py         # 统一配置读取（env + 可选 json）
+    ├── paths.py          # 唯一的项目目录 / 会话查找实现
+    └── tokens.py         # 唯一的 token 估算实现
 ```
 
 这些脚本对你的代码一律只读，只会在 `~/.claude/` 和当前目录的 `.ctxguard-paste/` 下写文件。
@@ -179,8 +188,59 @@ python -I $S/watchdog.py --dir "/path/to/your/project" --threshold 82 --poll 20 
 | `CTXGUARD_BLOCK` | `on` | 设为 `off` → `gate.py` 退化为"只提醒不拦" |
 | `CTXGUARD_PASTE_KB` | `12` | 触发自动切块的粘贴大小 |
 | `CTXGUARD_CHUNK_KB` | `40` | `split.py` 的切块大小 |
+| `CTXGUARD_HARNESS` | 空 | 点名用哪个适配器；空 = 自动探测 |
+| `CTXGUARD_ADAPTERS` | 空 | 限制自动探测的候选集，如 `claude,codex` |
+| `CTXGUARD_STATE_DIR` | 空 | 运行时状态根目录；空 = 该工具的默认位置 |
+
+也可以把它们写进一个扁平 JSON（`~/.claude/ctxguard.json`，键名省掉 `CTXGUARD_` 前缀），
+整份文件不存在也不影响，纯环境变量照样跑。
 
 不想被打断的话，把 `gate.py` 换成更温和的 `hook_guard.py` 就行——它从不拦截，永远 `exit 0`。
+
+---
+
+## 支持哪些工具
+
+"换个工具就得把整套重写一遍"是这个项目一开始最想避免的结局。所以读会话、判用量、拦工具、
+起新会话这些**环境事实**全部抽进了一层适配器，脚本本身只跟适配器说话。
+
+| 能力 | Claude Code | Codex CLI | OpenAI Agents SDK |
+|---|---|---|---|
+| 识别自身（`detect`） | ✅ | ✅ 环境指纹 | ✅ |
+| 会话记录 → 归一化事件流 | ✅ 已实测 | ⛔ 骨架 | ⛔ |
+| 读上下文占用 | ✅ statusline 落盘 | ⛔ | ⚠️ 只统计单次调用 |
+| 判会话 busy/idle | ✅ `agents --json`，带文件兜底 | ⛔ | ⛔ |
+| 拦截工具调用 | ✅ `exit 2` | ⛔ | ✅ 抛错 |
+| 注入上下文 | ✅ `hookSpecificOutput` | ⛔ | ✅ |
+| 起新会话接力 | ✅ `claude --bg` | ⛔ | ⛔ |
+
+⛔ 不是"永远不行"，是**眼下这条没实现、也没验证过**——缺了它只是对应功能降级（只提醒、
+或让你手动开新会话），不会让别的功能跟着一起坏。这就是"能力可选"的意思。
+
+> **诚实交代：** `adapter_codex.py` 和 `adapter_openai.py` 都**没有在真机上跑通过**。
+> 前者的目录规则是从 Codex 的公开源码里读出来的，后者靠鸭子类型反射 SDK 的 hooks 对象
+> （那个 SDK 的 hook 方法名正在改，所以故意不 import 具体名字）。文件头都写了"未实测"和
+> 待办清单。想接新工具，见 [`docs/adding-a-harness.md`](docs/adding-a-harness.md)。
+
+### hook 不会被某个版本改名搞死
+
+4 个 hook 脚本都不再直接 `json.load(sys.stdin)`，而是走一道统一的输入大门：读得到"认识的
+字段"才处理，否则回一个空答复就退出。所以**事件改名、字段改名、或者脚本被别的工具当模块
+import（根本没有 stdin）**，都不会让它崩掉或卡死，最多是安静地什么都不做。
+
+---
+
+## 测试
+
+不需要装任何东西（只用标准库），也不需要网络：
+
+```bash
+python -I tests/run_tests.py          # 42 项：token 估算 / 目录规则 / 适配器 / 四个 hook 端到端
+python -I tests/abcompare.py <旧目录> <新目录> <载荷目录>   # 逐字节对照新旧脚本的输出
+```
+
+`abcompare.py` 是这套改动的安全网：拿同一批真实 hook 载荷分别喂给新旧两版脚本，
+把 `(退出码, stdout, stderr)` 三元组逐一对比。改动的验收标准是**差异数为 0**。
 
 ---
 
@@ -190,7 +250,8 @@ python -I $S/watchdog.py --dir "/path/to/your/project" --threshold 82 --poll 20 
   Linux / macOS 要自己调路径，`watchdog.cmd` 也换成对应 shell 的启动脚本。
 - `gate.py` 的硬拦截靠的是 `PreToolUse` 退出码 2 的官方语义（stderr 回传给模型）。这个语义有
   文档和契约背书；但在这台机器上没能复现完整的端到端拦截，细节写在代码注释里。
-- 只依赖 Python 3 标准库，没有任何第三方依赖。
+- 只依赖 Python 3 标准库，没有任何第三方依赖。（适配器里对 OpenAI SDK 的引用是鸭子类型的，
+  装了才用，没装不影响。）
 
 ## 许可
 

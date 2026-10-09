@@ -1,6 +1,6 @@
 ---
 name: ctx-guard
-description: 防止上下文爆仓（爆 context / 爆 token）。当用户说"爆上下文/上下文太长/要不要 /clear/又满了/接不上了/上下文还有多少"，或一次会话体积超过 ~10 MB，或要粘/读一大段文本、大日志、大批文件（>~12 KB）、要连续做很多条独立任务时，用本技能。含：session 体检(scan.py)、巨会话压成交接单(digest.py)、长文本切块分段执行(split.py)、已挂载的自动护栏(gate/paste_split/statusline)。
+description: 防止上下文爆仓（爆 context / 爆 token）。当用户说"爆上下文/上下文太长/要不要 /clear/又满了/接不上了/上下文还有多少"，或一次会话体积超过 ~10 MB，或要粘/读一大段文本、大日志、大批文件（>~12 KB）、要连续做很多条独立任务时，用本技能。含：session 体检(scan.py)、巨会话压成交接单(digest.py)、长文本切块分段执行(split.py)、已挂载的自动护栏(gate/paste_split/statusline)。内部按 harness 适配层组织（Claude Code 默认、最完整；Codex / OpenAI SDK 有其适配器骨架），换工具不用改脚本。
 ---
 
 # ctx-guard —— 防止上下文爆仓
@@ -113,18 +113,23 @@ watchdog 用它拿用量，用 `claude agents --json` 判断会话死活/busy/id
 
 ## 3. 已挂载的自动护栏（`~/.claude/settings.json`，重开会话生效）
 
-| 事件 | 脚本 | 行为 |
-|---|---|---|
-| `PreToolUse` (Read\|Bash) | `gate.py` | **拦截**：整读 >200 KB 文本 / 无节流的裸 `cat` 大文件 → exit 2，把"改用 offset/limit | head"喂回模型重试 |
-| `UserPromptSubmit` | `paste_split.py` | 长粘贴自动落盘+切块+给分段指令 |
-| `SessionStart` | `session_resume.py` | 重启后**自动注入**上一会话的 `RESUME_NEXT.md` 并消费掉（"爆了重启接任务"的自动一半） |
-| `statusLine` | `statusline.py` | 显示 `ctx NN%`，并把用量写 `~/.claude/ctx-guard-usage.json` 供 gate 参考 |
+| 事件 | 脚本 | 行为 | 非 Claude 工具下 |
+|---|---|---|---|
+| `PreToolUse` (Read\|Bash) | `gate.py` | **拦截**：整读 >200 KB 文本 / 无节流的裸 `cat` 大文件 → exit 2，把"改用 offset/limit | head"喂回模型重试 | 能拦则拦（退出码由适配器定）；拦不了自动退化成"只注入提醒" |
+| `UserPromptSubmit` | `paste_split.py` | 长粘贴自动落盘+切块+给分段指令 | 同上，注入方式由适配器决定 |
+| `SessionStart` | `session_resume.py` | 重启后**自动注入**上一会话的 `RESUME_NEXT.md` 并消费掉（"爆了重启接任务"的自动一半） | 有对应事件就注入，没有就手动贴 |
+| `statusLine` | `statusline.py` | 显示 `ctx NN%`，并把用量写 `~/.claude/ctx-guard-usage.json` 供 gate 参考 | 该工具没有状态栏 → 只是少一行显示，护栏照常 |
 
 **gate 有意放行的**（不误杀）：图片(`.png/.jpg/…`，panel 封顶)、`.jsonl/.log`（交给提醒版）、
 小文件、已带 `head`/`|`/`>`/offset/limit 的调用。默认阈值 200 KB。
 调参（写进 settings.json 的 `env`）：`CTXGUARD_READ_KB`、`CTXGUARD_BLOCK`(off=只提醒不拦)、
 `CTXGUARD_PASTE_KB`、`CTXGUARD_CHUNK_KB`。
 关掉拦截：把 `CTXGUARD_BLOCK` 设 `off`，或删掉 `hooks`/`statusLine` 键。
+
+**换工具时不用改脚本。** 读会话、判用量、拦工具、起新会话这些环境差异都在
+`scripts/adapter_*.py` 里；`CTXGUARD_HARNESS=<名字>` 可以点名用哪个适配器，空则自动探测。
+当前：Claude Code 完整可用；Codex / OpenAI Agents SDK 有骨架但**未在真机验证**。
+写新适配器见仓库根的 `docs/adding-a-harness.md`。
 
 `hook_guard.py` 是更轻的**纯提醒版**（exit 0，从不拦），若不想被 gate 打断可改挂它：
 ```json

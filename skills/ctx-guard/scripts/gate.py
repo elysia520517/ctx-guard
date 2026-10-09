@@ -22,11 +22,17 @@ try:
 except Exception:
     pass
 
-USAGE_FILE = os.path.join(os.path.expanduser("~"), ".claude", "ctx-guard-usage.json")
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+import harness as _harness     # 适配器 + hook 输入大门
+import config as _config       # 统一配置读取
 
-READ_KB = float(os.environ.get("CTXGUARD_READ_KB", "200") or 200)
+H = None                       # 延迟到 main 里取，避免 import 时就探测
+
+READ_KB = _config.number("READ_KB", 200)
 LIMIT = int(READ_KB * 1024)
-BLOCK = (os.environ.get("CTXGUARD_BLOCK", "on").lower() != "off")
+BLOCK = _config.flag("BLOCK", "on")
 
 BIG_DUMP = re.compile(r"^\s*(cat|type|Get-Content|gc)\s+(?:-[A-Za-z]+\s+)*[\"']?([^\"'|><\s]+)",
                       re.I)
@@ -41,15 +47,16 @@ IMG_EXT = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico", ".tif", ".t
 def usage_note():
     """若用量看板文件新鲜且占用高，附一句。"""
     try:
-        with open(USAGE_FILE, encoding="utf-8") as fh:
-            u = json.load(fh)
-        if time.time() - u.get("ts", 0) < 60 and isinstance(u.get("used_percentage"),
-                                                             (int, float)):
-            p = u["used_percentage"]
-            if p >= 80:
-                return " 另：当前上下文已占 %.0f%%，这一轮干完就 /clear（先 digest.py）。" % p
-            if p >= 60:
-                return " 另：上下文已 %.0f%%，注意收着干。" % p
+        u = H.context_usage(max_age_s=60)
+        if not u:
+            return ""
+        p = u.get("used_percentage")
+        if not isinstance(p, (int, float)):
+            return ""
+        if p >= 80:
+            return " 另：当前上下文已占 %.0f%%，这一轮干完就 /clear（先 digest.py）。" % p
+        if p >= 60:
+            return " 另：上下文已 %.0f%%，注意收着干。" % p
     except Exception:
         pass
     return ""
@@ -62,8 +69,7 @@ def block_exit(msg):
 
 def allow_ctx(msg):
     # 不拦，只把提醒作为附加上下文注入
-    print(json.dumps({"hookSpecificOutput": {
-        "hookEventName": "PreToolUse", "additionalContext": "[ctx-guard] " + msg}}))
+    H.inject_context(None, "[ctx-guard] " + msg, default_event="PreToolUse")
     sys.exit(0)
 
 
@@ -75,11 +81,20 @@ def size_of(p):
 
 
 def main():
-    try:
-        d = json.load(sys.stdin)
-    except Exception:
+    global H
+    H = _harness.get_adapter()
+    if not BLOCK:
+        # 只提醒不拦的形态：即便配置成 off，也走同一套注入
+        pass
+
+    # hook 输入大门：拿不到"像是喂给我们的"载荷就直接空回复退出（版本改名/被当模块导入都不炸）
+    d = _harness.any_stdin_payload()
+    if d is None:
+        _harness.emit_empty()
         return
-    name = d.get("tool_name") or ""
+
+    raw_name = d.get("tool_name") or ""
+    name = H.canonical_tool(raw_name)      # 各 harness 的工具名映射到规范名
     inp = d.get("tool_input") or {}
     cwd = d.get("cwd") or os.getcwd()
 

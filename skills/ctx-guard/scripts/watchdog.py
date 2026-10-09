@@ -29,16 +29,37 @@ try:
 except Exception:
     pass
 
-HOME = os.path.expanduser("~")
-SESS_DIR = os.path.join(HOME, ".claude", "ctx-guard-sessions")
-PROJ_ROOT = os.path.join(HOME, ".claude", "projects")
 SCRIPTS = os.path.dirname(os.path.abspath(__file__))
+if SCRIPTS not in sys.path:
+    sys.path.insert(0, SCRIPTS)
+import harness as _harness     # harness 探测 + 适配器（会话清单/起会话/目录规则都走它）
+
+H = None                       # 在 main 里赋值；模块级只放路径函数
+
 RESUME = os.path.join(SCRIPTS, "resume.py")
-STATE = os.path.join(HOME, ".claude", "ctx-guard-watchdog.json")
+
+
+def _adapter():
+    global H
+    if H is None:
+        H = _harness.get_adapter()
+    return H
 
 
 def slug(cwd):
-    return re.sub(r"[^A-Za-z0-9]", "-", cwd)
+    return _adapter().locator().slug(cwd)
+
+
+def proj_root():
+    return _adapter().locator().projects_root
+
+
+def sess_dir():
+    return _adapter().sessions_dir()
+
+
+def state_path():
+    return _adapter().state_file("ctx-guard-watchdog.json")
 
 
 def norm(p):
@@ -57,7 +78,7 @@ def log(path, msg):
 
 def fresh_sessions(watch_dir):
     out = []
-    for f in glob.glob(os.path.join(SESS_DIR, "*.json")):
+    for f in glob.glob(os.path.join(sess_dir(), "*.json")):
         try:
             u = json.load(open(f, encoding="utf-8"))
         except Exception:
@@ -71,40 +92,39 @@ def fresh_sessions(watch_dir):
 
 
 def agents_map():
-    """sessionId -> record；取不到返回 None（区别于空 dict）。"""
+    """sessionId -> record；取不到返回 None（区别于空 dict）。
+
+    走适配器：Claude 用 `claude agents --json`，没有这个命令的 harness 由它自己降级。
+    """
     try:
-        p = subprocess.run(["claude", "agents", "--json"], capture_output=True,
-                           text=True, timeout=30)
-        arr = json.loads(p.stdout or "[]")
-        return {s.get("sessionId"): s for s in arr if isinstance(s, dict)}
+        return _adapter().sessions_map()
     except Exception:
         return None
 
 
 def load_state():
     try:
-        return json.load(open(STATE, encoding="utf-8"))
+        return json.load(open(state_path(), encoding="utf-8"))
     except Exception:
         return {}
 
 
 def save_state(st):
     try:
-        json.dump(st, open(STATE, "w", encoding="utf-8"), ensure_ascii=False)
+        json.dump(st, open(state_path(), "w", encoding="utf-8"), ensure_ascii=False)
     except Exception:
         pass
 
 
 def transcript(session_id):
-    hits = glob.glob(os.path.join(PROJ_ROOT, "*", "%s.jsonl" % session_id))
-    return max(hits, key=os.path.getmtime) if hits else None
+    return _adapter().locator().find_by_session(session_id)
 
 
 def write_handoff(session_id, watch_dir):
     tr = transcript(session_id)
     if not tr:
-        cand = glob.glob(os.path.join(PROJ_ROOT, slug(watch_dir), "*.jsonl"))
-        tr = max(cand, key=os.path.getmtime) if cand else None
+        tr = _adapter().locator().newest_transcript(
+            _adapter().locator().project_dir(watch_dir))
     if not tr:
         return None
     try:
@@ -113,7 +133,7 @@ def write_handoff(session_id, watch_dir):
     except Exception:
         return None
     for d in dict.fromkeys([os.path.dirname(tr),
-                            os.path.join(PROJ_ROOT, slug(watch_dir))]):
+                            _adapter().locator().project_dir(watch_dir)]):
         p = os.path.join(d, "RESUME_NEXT.md")
         if os.path.exists(p):
             return p
@@ -124,19 +144,19 @@ def launch(watch_dir, model, dry):
     seed = ("接着上一个会话未完成的任务继续干。交接单见 RESUME_NEXT.md"
             "（若已自动注入则直接照它继续）：已完成、已落盘的改动不要重做，"
             "从\"上次停在哪\"续；要读大文件/长文本先切块再派子代理。")
-    cmd = ["claude", "--bg"] + (["--model", model] if model else []) + [seed]
     if dry:
         return "(dry-run)"
     try:
-        p = subprocess.run(cmd, cwd=watch_dir, capture_output=True, text=True,
-                           timeout=180)
+        status, detail = _adapter().launch_continue(watch_dir, seed, model)
     except Exception as e:
         return "ERR:%s" % e
-    out = (p.stdout or "") + (p.stderr or "")
-    if "not trusted" in out.lower():
+    if status == "untrusted":
         return "UNTRUSTED"
-    m = re.findall(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", out)
-    return m[-1] if m else "LAUNCHED"
+    if status == "launched":
+        return detail or "LAUNCHED"
+    if status == "unsupported":
+        return "UNSUPPORTED"
+    return "ERR:%s" % detail
 
 
 def decide(rec_live, status, usage, last_status, thr):
@@ -225,6 +245,10 @@ def main():
                     if sid == "UNTRUSTED":
                         log(lg, "！！目标目录未被信任：请在 %s 里交互式跑一次 "
                                "`claude` 并接受信任提示。watchdog 停止。" % watch_dir)
+                        return
+                    if sid == "UNSUPPORTED":
+                        log(lg, "当前 harness 不支持自动起会话，watchdog 停止"
+                               "（交接单已写好，请手动开新会话说\"继续\"）。")
                         return
                     restarts += 1
                     watched = None

@@ -24,18 +24,15 @@ except Exception:
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import digest as dg            # 复用同一套抽取逻辑，单一事实来源
+import harness as _harness     # harness 探测 + 适配器（含 project_dir / slug）
 
 
 def project_dir(cwd=None):
-    cwd = cwd or os.getcwd()
-    slug = re.sub(r"[^A-Za-z0-9]", "-", cwd)   # Claude 的项目目录名规则：所有非字母数字 -> "-"
-    return os.path.join(os.path.expanduser("~"), ".claude", "projects", slug)
+    return _harness.locator().project_dir(cwd)
 
 
 def newest(pdir, nth=0):
-    files = sorted(glob.glob(os.path.join(pdir, "*.jsonl")),
-                   key=os.path.getmtime, reverse=True)
-    return files[nth] if len(files) > nth else None
+    return _harness.locator().newest_transcript(pdir, nth)
 
 
 def main():

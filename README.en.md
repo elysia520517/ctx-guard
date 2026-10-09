@@ -68,7 +68,16 @@ skills/ctx-guard/
     ├── paste_split.py    # UserPromptSubmit: long paste → disk + chunks + rules
     ├── session_resume.py # SessionStart: auto-inject the handoff on restart
     ├── statusline.py     # statusLine: show `ctx NN%`, write usage for the watchdog
-    └── watchdog.py       # auto-restart when a busy session nears the limit
+    ├── watchdog.py       # auto-restart when a busy session nears the limit
+    │
+    ├── harness.py        # detect which tool we're under + the stdin gate
+    ├── adapter_base.py   # adapter base class + the normalized event stream
+    ├── adapter_claude.py # Claude Code adapter (default, most complete)
+    ├── adapter_codex.py  # Codex CLI adapter (skeleton, unverified)
+    ├── adapter_openai.py # OpenAI Agents SDK adapter (duck-typed)
+    ├── config.py         # unified config (env + optional json)
+    ├── paths.py          # the one project-dir / transcript lookup
+    └── tokens.py         # the one token estimator
 ```
 
 Every script is **read-only** with respect to your code. They only write under
@@ -177,9 +186,68 @@ Windows consoles default to GBK, which would garble the Chinese these scripts pr
 | `CTXGUARD_BLOCK` | `on` | `off` → `gate.py` becomes reminder-only |
 | `CTXGUARD_PASTE_KB` | `12` | paste size that triggers auto-chunking |
 | `CTXGUARD_CHUNK_KB` | `40` | chunk size for `split.py` |
+| `CTXGUARD_HARNESS` | empty | force a specific adapter; empty = auto-detect |
+| `CTXGUARD_ADAPTERS` | empty | restrict auto-detect candidates, e.g. `claude,codex` |
+| `CTXGUARD_STATE_DIR` | empty | runtime state root; empty = the tool's default |
+
+They can also live in a flat JSON file (`~/.claude/ctxguard.json`, keys without the
+`CTXGUARD_` prefix). The file is entirely optional — env vars alone work fine.
 
 Prefer the gentler `hook_guard.py` (never blocks, always `exit 0`) over `gate.py` if you
 don't want interruptions.
+
+---
+
+## Which tools it supports
+
+"Switch tools, rewrite everything" is the ending this project most wanted to avoid. So the
+environment facts — how a session is stored, how usage is reported, how a tool call is
+blocked, how a new session is started — all live behind an adapter layer. The scripts only
+ever talk to the adapter.
+
+| capability | Claude Code | Codex CLI | OpenAI Agents SDK |
+|---|---|---|---|
+| identify itself (`detect`) | ✅ | ✅ env fingerprint | ✅ |
+| transcript → normalized events | ✅ verified | ⛔ skeleton | ⛔ |
+| read context usage | ✅ via statusline | ⛔ | ⚠️ per-call only |
+| busy/idle session status | ✅ `agents --json` + file fallback | ⛔ | ⛔ |
+| block a tool call | ✅ `exit 2` | ⛔ | ✅ raises |
+| inject context | ✅ `hookSpecificOutput` | ⛔ | ✅ |
+| launch a follow-up session | ✅ `claude --bg` | ⛔ | ⛔ |
+
+⛔ doesn't mean "impossible" — it means **not implemented and not verified yet**. A missing
+capability degrades that one feature (reminder-only, or you start the new session by hand);
+it never takes the others down with it. That is what "capabilities are optional" buys.
+
+> **Full disclosure:** neither `adapter_codex.py` nor `adapter_openai.py` has been run on a
+> real install. The former's directory rules were read out of Codex's public source; the
+> latter reflects over the SDK's hooks object by duck typing (that SDK is actively renaming
+> its hook methods, so it deliberately imports no method names). Both files say "unverified"
+> at the top and carry a to-do list. To add a tool, see
+> [`docs/adding-a-harness.md`](docs/adding-a-harness.md).
+
+### A renamed hook event can't kill the hooks
+
+None of the four hook scripts calls `json.load(sys.stdin)` directly anymore. They all go
+through one stdin gate: process the payload only if it carries a field we recognize,
+otherwise emit an empty reply and exit. So **a renamed event, a renamed field, or the script
+being imported as a module (no stdin at all)** can't crash or hang it — the worst case is it
+quietly does nothing.
+
+---
+
+## Tests
+
+Nothing to install (standard library only), no network needed:
+
+```bash
+python -I tests/run_tests.py          # 42 checks: tokens / path rules / adapters / 4 hooks e2e
+python -I tests/abcompare.py <old_dir> <new_dir> <payload_dir>   # byte-for-byte A/B of old vs new
+```
+
+`abcompare.py` is the safety net for this refactor: feed the same set of real hook payloads
+to the old and new scripts and compare the `(returncode, stdout, stderr)` triples. The
+acceptance bar is **zero differences**.
 
 ---
 
@@ -191,7 +259,8 @@ don't want interruptions.
 - `gate.py`'s hard block relies on the documented `PreToolUse` exit-code-2 semantics
   (stderr fed back to the model). Verified via docs/contract; the block path was not
   reproduced end-to-end on this machine — see the code comments.
-- Requires only the Python 3 standard library. No dependencies.
+- Requires only the Python 3 standard library. No dependencies. (The adapter's reference to
+  the OpenAI SDK is duck-typed: used only if you have it installed.)
 
 ## License
 

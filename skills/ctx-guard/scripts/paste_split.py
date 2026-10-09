@@ -20,9 +20,15 @@ except Exception:
     pass
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+import harness as _harness     # 适配器 + hook 输入大门
+import config as _config       # 统一配置读取
+
+H = None
 SPLIT = os.path.join(HERE, "split.py")
-THRESH_KB = float(os.environ.get("CTXGUARD_PASTE_KB", "12") or 12)
-CHUNK_KB = float(os.environ.get("CTXGUARD_CHUNK_KB", "40") or 40)
+THRESH_KB = _config.number("PASTE_KB", 12)
+CHUNK_KB = _config.number("CHUNK_KB", 40)
 THRESH = int(THRESH_KB * 1024)
 
 PREFIXES = ("This session is being continued", "[Image:", "<", "Caveat:")
@@ -34,9 +40,10 @@ def est_tok(s):
 
 
 def main():
-    try:
-        d = json.load(sys.stdin)
-    except Exception:
+    global H
+    H = _harness.get_adapter()
+    d = _harness.any_stdin_payload()
+    if d is None:
         return
     prompt = d.get("prompt")
     if not isinstance(prompt, str):
@@ -80,8 +87,7 @@ def main():
         msg += "  切成块失败，请手动分块或用 Grep 定位需要的区间。\n"
     msg += "  若确实需要原文进上下文，请明确说\"整段读\"。"
 
-    print(json.dumps({"hookSpecificOutput": {
-        "hookEventName": "UserPromptSubmit", "additionalContext": msg}}))
+    H.inject_context(d, msg, default_event="UserPromptSubmit")
 
 
 if __name__ == "__main__":

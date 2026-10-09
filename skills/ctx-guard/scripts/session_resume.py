@@ -15,28 +15,33 @@ try:
 except Exception:
     pass
 
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+import harness as _harness     # 适配器 + hook 输入大门
+
 MAX_AGE = 24 * 3600
 
 
 def project_dir(cwd):
-    slug = re.sub(r"[^A-Za-z0-9]", "-", cwd)   # Claude 的项目目录名规则：所有非字母数字 -> "-"
-    return os.path.join(os.path.expanduser("~"), ".claude", "projects", slug)
+    return _harness.locator().project_dir(cwd)
 
 
 def main():
-    try:
-        d = json.load(sys.stdin)
-    except Exception:
-        d = {}
+    d = _harness.any_stdin_payload()
+    if d is None:
+        return
+    H = _harness.get_adapter()
     cwd = d.get("cwd") or os.getcwd()
 
+    loc = _harness.locator()
     path = None
     for pdir in dict.fromkeys([project_dir(cwd), project_dir(os.getcwd())]):
         cand = os.path.join(pdir, "RESUME_NEXT.md")
         if os.path.exists(cand):
             path = cand
             break
-    if not path or time.time() - os.path.getmtime(path) > MAX_AGE:
+    if not path or loc.stale(path, MAX_AGE):
         return
 
     try:
@@ -57,8 +62,7 @@ def main():
     except Exception:
         pass
 
-    print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart",
-                                             "additionalContext": msg}}))
+    H.inject_context(d, msg, default_event="SessionStart")
 
 
 if __name__ == "__main__":

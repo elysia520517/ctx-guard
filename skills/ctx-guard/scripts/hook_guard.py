@@ -15,6 +15,13 @@ try:                       # Windows 控制台默认 GBK，会把中文提醒打
 except Exception:
     pass
 
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+import harness as _harness     # 适配器 + hook 输入大门
+
+H = None
+
 # 明显会倒大输出的命令特征
 BIG_CMD = re.compile(
     r"(\bcat\b|\bless\b|\bmore\b|\bfind\s+/|\bgit\s+log\b(?!.*-n\b)(?!.*--oneline)"
@@ -34,12 +41,13 @@ def warn(text):
 
 
 def main():
+    global H
+    H = _harness.get_adapter()
+    data = _harness.any_stdin_payload()
+    if data is None:
+        return                      # 不是给我们的输入：静默退出（本脚本从不输出 JSON）
     try:
-        data = json.load(sys.stdin)
-    except Exception:
-        return
-    try:
-        name = data.get("tool_name") or ""
+        name = H.canonical_tool(data.get("tool_name") or "")
         inp = data.get("tool_input") or {}
 
         if name == "Bash":

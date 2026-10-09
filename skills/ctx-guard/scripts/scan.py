@@ -19,62 +19,27 @@ try:
 except Exception:
     pass
 
-ASCII_DIV = 3.6      # 英文/代码 ~3.6 字节/token
-CJK_MUL = 1.15       # 中文 ~1.15 token/字
-IMG_MAX = 1600       # Claude 单图 token 上限（长边 1568px）
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+import harness as _harness          # harness 探测 + 适配器
+import tokens as _tokens            # token 估算（唯一实现，见 tokens.py）
 
-
-def est_tok(s: str) -> int:
-    a = sum(1 for ch in s if ord(ch) < 128)
-    return int(a / ASCII_DIV + (len(s) - a) * CJK_MUL)
-
-
-def img_dims(b64: str):
-    """从 base64 图像头里读宽高（PNG / JPEG）。读不到返回 None。"""
-    try:
-        raw = base64.b64decode(b64[:6000], validate=False)
-    except Exception:
-        return None
-    if raw[:8] == b"\x89PNG\r\n\x1a\n" and len(raw) >= 24:
-        w = int.from_bytes(raw[16:20], "big")
-        h = int.from_bytes(raw[20:24], "big")
-        return (w, h) if 0 < w < 100000 and 0 < h < 100000 else None
-    if raw[:2] == b"\xff\xd8":                      # JPEG: 找 SOF 段
-        i = 2
-        while i + 9 < len(raw):
-            if raw[i] != 0xFF:
-                i += 1; continue
-            m = raw[i + 1]
-            if m in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
-                     0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF) and i + 9 < len(raw):
-                h = int.from_bytes(raw[i + 5:i + 7], "big")
-                w = int.from_bytes(raw[i + 7:i + 9], "big")
-                return (w, h)
-            if m in (0xD8, 0xD9) or 0xD0 <= m <= 0xD7:
-                i += 2; continue
-            seg = int.from_bytes(raw[i + 2:i + 4], "big")
-            i += 2 + seg
-        return None
-    return None
-
-
-def img_tok(b64len: int, dims):
-    if dims:
-        return min(IMG_MAX, max(1, round(dims[0] * dims[1] / 750)))
-    # 未知尺寸时，按 base64 长度的常见压缩率粗估像素
-    approx_px = (b64len * 3 // 4) * 8
-    return min(IMG_MAX, max(1, round(approx_px / 750)))
+# 兼容旧名字：外面若还在 import ASCII_DIV / est_tok / img_tok 也照旧可用
+ASCII_DIV = _tokens.ASCII_DIV
+CJK_MUL = _tokens.CJK_MUL
+IMG_MAX = _tokens.IMG_MAX
+est_tok = _tokens.est_tok
+img_dims = _tokens.img_dims
+img_tok = _tokens.img_tok
 
 
 def project_dir(cwd=None):
-    cwd = cwd or os.getcwd()
-    slug = re.sub(r"[^A-Za-z0-9]", "-", cwd)   # Claude 的项目目录名规则：所有非字母数字 -> "-"
-    return os.path.join(os.path.expanduser("~"), ".claude", "projects", slug)
+    return _harness.locator().project_dir(cwd)
 
 
 def newest_transcript(pdir):
-    files = glob.glob(os.path.join(pdir, "*.jsonl"))
-    return max(files, key=os.path.getmtime) if files else None
+    return _harness.locator().newest_transcript(pdir)
 
 
 def label_of(name, inp):
@@ -104,94 +69,79 @@ def scan(path, top=10):
     nlines = 0
     n_summaries = 0
 
-    for line in open(path, "rb"):
-        nlines += 1
-        try:
-            d = json.loads(line)
-        except Exception:
-            continue
-        msg = d.get("message") or {}
-        content = msg.get("content")
-        role = msg.get("role") or d.get("type")
+    # 走适配器的归一化事件流：换 harness 只换适配器，这里的统计口径一个字都不动
+    A = _harness.get_adapter()
+    for ev in A.read_transcript(path):
+        k = ev.get("kind")
+        if k == "_stats":
+            nlines = ev.get("lines", 0)
+            break
 
-        if isinstance(content, str):
-            cat = "user_prompt(用户)" if role == "user" else "assistant_text(正文)"
-            cat_bytes[cat] += len(content.encode("utf-8", "ignore"))
+        if k == "text":
+            cls = "user" if ev.get("role") == "user" else "assistant"
+            cat = "user_prompt(用户)" if cls == "user" else "assistant_text(正文)"
+            txt = ev.get("text") or ""
+            cat_bytes[cat] += len(txt.encode("utf-8", "ignore"))
             cat_cnt[cat] += 1
-            cat_tok[cat] += est_tok(content)
-            if role == "user":
+            cat_tok[cat] += est_tok(txt)
+            if cls == "user":
                 user_prompts += 1
-                if content.startswith("This session is being continued"):
+                if ev.get("is_summary"):
                     n_summaries += 1
-                    cat = "  └其中:auto-compact摘要"
-                    cat_bytes[cat] += len(content.encode("utf-8", "ignore"))
-                    cat_cnt[cat] += 1
-            continue
-        if not isinstance(content, list):
-            continue
+                    sub = "  └其中:auto-compact摘要"
+                    cat_bytes[sub] += len(txt.encode("utf-8", "ignore"))
+                    cat_cnt[sub] += 1
 
-        for blk in content:
-            if not isinstance(blk, dict):
-                continue
-            t = blk.get("type")
-            if t == "tool_use":
-                id2label[blk.get("id")] = label_of(blk.get("name", "?"),
-                                                    blk.get("input") or {})
-                cat_bytes["tool_use(调用)"] += len(
-                    json.dumps(blk, ensure_ascii=False).encode("utf-8", "ignore"))
-                cat_cnt["tool_use(调用)"] += 1
-            elif t == "tool_result":
-                lab = id2label.get(blk.get("tool_use_id"), "?")
-                c = blk.get("content")
-                blocks = c if isinstance(c, list) else [{"type": "text", "text": c}]
-                nbytes = tok = 0
-                kinds = set()
-                preview = ""
-                for b in blocks:
-                    if not isinstance(b, dict):
-                        continue
-                    if b.get("type") == "image":
-                        src = b.get("source") or {}
-                        b64 = src.get("data", "") if isinstance(src, dict) else ""
-                        nb = len(b64) * 3 // 4
-                        if not nb:
-                            nb = len(json.dumps(b).encode())
-                        dims = img_dims(b64) if b64 else None
-                        nbytes += nb
-                        tok += img_tok(len(b64), dims)
-                        kinds.add("image")
-                        if not preview:
-                            preview = "图片 %s" % (
-                                "%dx%d" % dims if dims else "(尺寸未知)")
-                    else:
-                        txt = b.get("text") if isinstance(b, dict) else str(b)
-                        if txt is None:
-                            txt = json.dumps(b, ensure_ascii=False)
-                        nbytes += len(txt.encode("utf-8", "ignore"))
-                        tok += est_tok(txt)
-                        kinds.add("text")
-                        if not preview:
-                            preview = trim(txt)
-                kind = "+".join(sorted(kinds)) or "?"
-                cat = "tool_result(%s)" % kind
-                cat_bytes[cat] += nbytes
-                cat_cnt[cat] += 1
-                cat_tok[cat] += tok
-                heavy.append((nbytes, tok, lab, preview))
-            elif t == "thinking":
-                txt = blk.get("thinking", "")
-                cat_bytes["thinking(思考)"] += len(txt.encode("utf-8", "ignore"))
-                cat_cnt["thinking(思考)"] += 1
-                cat_tok["thinking(思考)"] += est_tok(txt)
-            elif t == "text":
-                txt = blk.get("text", "")
-                cat_bytes["assistant_text(正文)"] += len(txt.encode("utf-8", "ignore"))
-                cat_cnt["assistant_text(正文)"] += 1
-                cat_tok["assistant_text(正文)"] += est_tok(txt)
-            else:
-                k = "other:%s" % t
-                cat_bytes[k] += len(json.dumps(blk, ensure_ascii=False).encode())
-                cat_cnt[k] += 1
+        elif k == "tool_use":
+            id2label[ev.get("id")] = label_of(ev.get("name", "?"),
+                                              ev.get("input") or {})
+            cat_bytes["tool_use(调用)"] += ev.get("raw_len", 0)
+            cat_cnt["tool_use(调用)"] += 1
+
+        elif k == "tool_result":
+            lab = id2label.get(ev.get("tool_use_id"), "?")
+            nbytes = tok = 0
+            kinds = set()
+            preview = ""
+            for b in ev.get("blocks") or ():
+                bk = b[0] if isinstance(b, (tuple, list)) and b else None
+                if bk == "image":
+                    b64 = (b[1] if len(b) > 1 else "") or ""
+                    nb = len(b64) * 3 // 4
+                    if not nb:
+                        nb = len(json.dumps(b[2] if len(b) > 2 else b).encode())
+                    dims = img_dims(b64) if b64 else None
+                    nbytes += nb
+                    tok += img_tok(len(b64), dims)
+                    kinds.add("image")
+                    if not preview:
+                        preview = "图片 %s" % ("%dx%d" % dims if dims else "(尺寸未知)")
+                else:
+                    txt = b[1] if len(b) > 1 else ""
+                    if txt is None:
+                        txt = json.dumps(b[2] if len(b) > 2 else b, ensure_ascii=False)
+                    nbytes += len(txt.encode("utf-8", "ignore"))
+                    tok += est_tok(txt)
+                    kinds.add("text")
+                    if not preview:
+                        preview = trim(txt)
+            kk = "+".join(sorted(kinds)) or "?"
+            cat = "tool_result(%s)" % kk
+            cat_bytes[cat] += nbytes
+            cat_cnt[cat] += 1
+            cat_tok[cat] += tok
+            heavy.append((nbytes, tok, lab, preview))
+
+        elif k == "thinking":
+            txt = ev.get("text") or ""
+            cat_bytes["thinking(思考)"] += len(txt.encode("utf-8", "ignore"))
+            cat_cnt["thinking(思考)"] += 1
+            cat_tok["thinking(思考)"] += est_tok(txt)
+
+        elif k == "other":
+            kk = "other:%s" % ev.get("subtype")
+            cat_bytes[kk] += ev.get("raw_len", 0)
+            cat_cnt[kk] += 1
 
     total = os.path.getsize(path)
     tot_tok = sum(cat_tok.values())
@@ -232,12 +182,12 @@ def main():
     pdir = None
     if "--project" in args:
         i = args.index("--project")
-        pdir = os.path.join(os.path.expanduser("~"), ".claude", "projects",
+        pdir = os.path.join(_harness.get_adapter().locator().projects_root,
                             args[i + 1]); del args[i:i + 2]
     pdir = pdir or project_dir()
 
     if "--all" in args:
-        files = sorted(glob.glob(os.path.join(pdir, "*.jsonl")),
+        files = sorted(_harness.locator().transcripts(pdir),
                        key=os.path.getsize, reverse=True)
         if not files:
             print("找不到会话：%s" % pdir); return
